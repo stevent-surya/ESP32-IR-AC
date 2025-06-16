@@ -1,0 +1,406 @@
+#include <Arduino.h>
+#include <IRremoteESP8266.h> // Pustaka ini juga kompatibel dengan ESP32
+#include <IRsend.h>
+#include <ir_Daikin.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>      // <-- Library untuk mengambil data dari internet
+#include <Arduino_JSON.h>    // <-- Library untuk memproses data JSON
+#include <vector>
+#include <time.h>            // Pustaka untuk waktu dari internet (NTP)
+
+// --- Konfigurasi NTP (Jam Online) ---
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600;  // Offset GMT untuk WIB (UTC+7)
+const int   daylightOffset_sec = 0;    // Indonesia tidak punya daylight saving
+
+// --- Konfigurasi Weather API ---
+const char* openWeatherMapApiKey = "0282197f6f7a93232cb21c28695e4d76";
+String locationCity = "Detecting...";
+float externalTemp = 0.0;
+float externalHumidity = 0.0;
+String weatherCondition = "Unknown";
+unsigned long lastWeatherCheckTime = 0;
+const unsigned long WEATHER_CHECK_INTERVAL = 15 * 60 * 1000; // Cek cuaca setiap 15 menit
+
+// --- Konfigurasi Perangkat Keras ---
+#define BUZZER_PIN 16 // Pin GPIO16 untuk buzzer
+#define DHTPIN 5      // Pin GPIO5 untuk DHT22
+#define DHTTYPE DHT22 // Tipe sensor DHT22
+const uint16_t kIrLed = 4; // GPIO pin untuk IR LED
+
+// --- Inisialisasi Objek ---
+DHT dht(DHTPIN, DHTTYPE);
+IRDaikinESP ac(kIrLed);
+WebServer server(80);
+WiFiClientSecure client;
+
+// --- Variabel Global ---
+float currentRoomTemp = 0;
+float currentRoomHumidity = 0;
+unsigned long lastDHTReadTime = 0;
+const unsigned long DHT_READ_INTERVAL = 3000; // Baca DHT setiap 30 detik
+
+uint8_t currentFanSpeed = 1;
+bool swingHorizontal = false;
+bool swingVertical = false;
+uint8_t currentTemperature = 20;
+uint8_t currentMode = kDaikinFan; // Mode awal adalah Fan Only
+bool isACOn = false;
+bool isPowerfulModeOn = false;
+
+// --- Konfigurasi WiFi ---
+const char* sta_ssid = "Gabriel's Hotspot";
+const char* sta_password = "enakajalu";
+
+// Mode Access Point (Jika koneksi ke WiFi utama gagal)
+const char* ap_ssid = "ESP_REMOTE";
+const char* ap_password = "password123";
+IPAddress apIP(192, 168, 4, 1);
+IPAddress apGateway(192, 168, 4, 1);
+IPAddress apSubnet(255, 255, 255, 0);
+
+// --- Pencatatan Riwayat Sensor ---
+struct HistoryEntry {
+  uint32_t timestamp;
+  float temperature;
+  float humidity;
+};
+std::vector<HistoryEntry> sensorHistory;
+const size_t MAX_HISTORY_ENTRIES = 60;
+unsigned long lastHistoryLogTime = 0;
+const unsigned long HISTORY_LOG_INTERVAL = 5 * 60 * 1000; // Catat setiap 5 menit
+
+// --- Integrasi Google Sheets ---
+const char* GOOGLE_SCRIPT_ID = "AKfycby8bQGII_WLqvjx99QX-rhXfTDRBx2qdrfizG5Cd5yIyMYrw2pBlTCa4vUNct3n4njV";
+
+// --- Prototipe Fungsi ---
+void turnACOn(); void turnACOff(); void changeFanSpeed(); void toggleSwingHorizontal(); void toggleSwingVertical(); void increaseTemperature(); void decreaseTemperature(); void changeMode(); void activatePowerfulMode(); void deactivatePowerfulMode(); void readDHTSensor(); void playButtonSound(); void logAndSendData(); void sendDataToGoogleSheet(); void getWeatherData(); void handleHistory(); void handleRoot(); void handleDashboard(); void handleStatus(); void handleTime(); void handleExternalWeather(); void handleOn(); void handleOff(); void handleFan(); void handleSwingH(); void handleSwingV(); void handleTempUp(); void handleTempDown(); void handleMode(); void handlePowerful(); void handleCommand(String command); String getModeString(uint8_t mode); void serveHelloPage(); void serveDashboardPage();
+
+// =================================================================
+//  SETUP
+// =================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nAC Control via Serial Monitor and HTTP (ESP32) - On-Demand Refresh Version");
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  dht.begin();
+  ac.begin();
+  WiFi.mode(WIFI_AP_STA);
+  Serial.println("Configuring Access Point...");
+  WiFi.softAPConfig(apIP, apGateway, apSubnet);
+  WiFi.softAP(ap_ssid, ap_password);
+  Serial.print("AP SSID: "); Serial.println(ap_ssid);
+  Serial.print("AP IP address: "); Serial.println(WiFi.softAPIP());
+  Serial.print("Connecting to WiFi: "); Serial.println(sta_ssid);
+  WiFi.begin(sta_ssid, sta_password);
+  int connect_timeout = 20;
+  while (WiFi.status() != WL_CONNECTED && connect_timeout > 0) {
+    delay(500); Serial.print("."); connect_timeout--;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected (STA Mode)");
+    Serial.print("STA IP address: "); Serial.println(WiFi.localIP());
+    Serial.println("Configuring time from NTP server...");
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo)) {
+      Serial.println("Failed to obtain time, retrying..."); delay(1000);
+    }
+    Serial.println("Time successfully synchronized");
+    getWeatherData();
+    lastWeatherCheckTime = millis();
+  } else {
+    Serial.println("\nFailed to connect to STA WiFi. Continuing in AP mode only.");
+  }
+  client.setInsecure();
+  server.on("/", HTTP_GET, serveHelloPage);
+  server.on("/dashboard", HTTP_GET, serveDashboardPage);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.on("/time", HTTP_GET, handleTime);
+  server.on("/externalweather", HTTP_GET, handleExternalWeather);
+  server.on("/on", HTTP_GET, handleOn); server.on("/off", HTTP_GET, handleOff);
+  server.on("/fan", HTTP_GET, handleFan); server.on("/swingh", HTTP_GET, handleSwingH);
+  server.on("/swingv", HTTP_GET, handleSwingV); server.on("/tempup", HTTP_GET, handleTempUp);
+  server.on("/tempdown", HTTP_GET, handleTempDown); server.on("/mode", HTTP_GET, handleMode);
+  server.on("/powerful", HTTP_GET, handlePowerful);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// =================================================================
+//  LOOP
+// =================================================================
+void loop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    handleCommand(command);
+  }
+  server.handleClient();
+  readDHTSensor();
+  unsigned long currentMillis = millis();
+  if (WiFi.status() == WL_CONNECTED && currentMillis - lastHistoryLogTime >= HISTORY_LOG_INTERVAL) {
+    lastHistoryLogTime = currentMillis;
+    logAndSendData();
+  }
+  if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherCheckTime >= WEATHER_CHECK_INTERVAL) {
+    lastWeatherCheckTime = currentMillis;
+    getWeatherData();
+  }
+}
+
+// =================================================================
+//  Fungsi-Fungsi Bantuan & Kontrol
+// =================================================================
+void getWeatherData() { if (WiFi.status() != WL_CONNECTED) { Serial.println("Cannot get weather, WiFi not connected."); return; } HTTPClient http; String city = ""; String ipApiUrl = "http://ip-api.com/json/?fields=city"; http.begin(ipApiUrl); int httpCode = http.GET(); if (httpCode == HTTP_CODE_OK) { JSONVar myObject = JSON.parse(http.getString()); if (JSON.typeof(myObject) != "undefined") { city = JSON.stringify(myObject["city"]); city.replace("\"", ""); locationCity = city; Serial.print("Detected City: "); Serial.println(locationCity); } } http.end(); if (city == "") { Serial.println("Failed to get city from IP."); return; } String weatherApiUrl = "http://api.openweathermap.org/data/2.5/weather?q=" + city + "&appid=" + openWeatherMapApiKey + "&units=metric"; http.begin(weatherApiUrl); httpCode = http.GET(); if (httpCode == HTTP_CODE_OK) { JSONVar myObject = JSON.parse(http.getString()); if (JSON.typeof(myObject) != "undefined") { externalTemp = (double) myObject["main"]["temp"]; externalHumidity = (double) myObject["main"]["humidity"]; String mainCondition = JSON.stringify(myObject["weather"][0]["main"]); mainCondition.replace("\"", ""); weatherCondition = mainCondition; Serial.printf("External Weather: Temp = %.1f C, Condition = %s\n", externalTemp, weatherCondition.c_str()); } } else { Serial.printf("[HTTP] Weather GET... failed, error: %s\n", http.errorToString(httpCode).c_str()); } http.end(); }
+void playButtonSound() { tone(BUZZER_PIN, 2000, 50); }
+void readDHTSensor() { unsigned long currentMillis = millis(); if (currentMillis - lastDHTReadTime >= DHT_READ_INTERVAL) { lastDHTReadTime = currentMillis; float newTemp = dht.readTemperature(); float newHumidity = dht.readHumidity(); if (!isnan(newTemp)) { currentRoomTemp = newTemp; } if (!isnan(newHumidity)) { currentRoomHumidity = newHumidity; } } }
+void logAndSendData() { HistoryEntry newEntry; newEntry.timestamp = time(nullptr); newEntry.temperature = currentRoomTemp; newEntry.humidity = currentRoomHumidity; if (sensorHistory.size() >= MAX_HISTORY_ENTRIES) { sensorHistory.erase(sensorHistory.begin()); } sensorHistory.push_back(newEntry); sendDataToGoogleSheet(); }
+void sendDataToGoogleSheet() { if (isnan(currentRoomTemp) || isnan(currentRoomHumidity) || WiFi.status() != WL_CONNECTED) { return; } String url = String("https://script.google.com/macros/s/") + GOOGLE_SCRIPT_ID + "/exec" + "?temperature=" + String(currentRoomTemp, 2) + "&humidity=" + String(currentRoomHumidity, 2) + "&timestamp=" + String(time(nullptr)); if (client.connect("script.google.com", 443)) { client.println(String("GET ") + url + " HTTP/1.1"); client.println("Host: script.google.com"); client.println("Connection: close"); client.println(); client.stop(); } }
+
+// =================================================================
+//  Fungsi-Fungsi untuk Handler Server Web
+// =================================================================
+
+void serveHelloPage() { String html = R"rawliteral( <!DOCTYPE html> <html lang="id"> <head> <meta charset="UTF-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <title>Welcome</title> <style> body, html { height: 100%; margin: 0; display: flex; justify-content: center; align-items: center; background-color: #000000; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; overflow: hidden; transition: opacity 0.5s ease-out; } .text-container { text-align: center; position: relative; width: 400px; height: 100px; display: flex; justify-content: center; align-items: center; } .text-container span { position: absolute; font-size: 56px; font-weight: 300; color: #FFFFFF; opacity: 0; animation-timing-function: ease-in-out; animation-fill-mode: forwards; } .text-container span:nth-child(1) { animation-name: text-anim; animation-duration: 2.5s; animation-delay: 0s; } .text-container span:nth-child(2) { animation-name: text-anim; animation-duration: 2.5s; animation-delay: 2.5s; } @keyframes text-anim { 0% { opacity: 0; } 20% { opacity: 1; } 80% { opacity: 1; } 100% { opacity: 0; } } .container { display: none; opacity: 0; transition: opacity 0.3s ease-in; } .loader { position: absolute; top: 50%; left: 50%; z-index: 10; width: 160px; height: 100px; margin-left: -80px; margin-top: -50px; border-radius: 5px; background: #1e3f57; animation: dot1_ 3s cubic-bezier(0.55,0.3,0.24,0.99) infinite; } .loader:nth-child(2) { z-index: 11; width: 150px; height: 90px; margin-top: -45px; margin-left: -75px; border-radius: 3px; background: #3c517d; animation-name: dot2_; } .loader:nth-child(3) { z-index: 12; width: 40px; height: 20px; margin-top: 50px; margin-left: -20px; border-radius: 0 0 5px 5px; background: #6bb2cd; animation-name: dot3_; } @keyframes dot1_ { 3%,97% { width: 160px; height: 100px; margin-top: -50px; margin-left: -80px; } 30%,36% { width: 80px; height: 120px; margin-top: -60px; margin-left: -40px; } 63%,69% { width: 40px; height: 80px; margin-top: -40px; margin-left: -20px; } } @keyframes dot2_ { 3%,97% { height: 90px; width: 150px; margin-left: -75px; margin-top: -45px; } 30%,36% { width: 70px; height: 96px; margin-left: -35px; margin-top: -48px; } 63%,69% { width: 32px; height: 60px; margin-left: -16px; margin-top: -30px; } } @keyframes dot3_ { 3%,97% { height: 20px; width: 40px; margin-left: -20px; margin-top: 50px; } 30%,36% { width: 8px; height: 8px; margin-left: -5px; margin-top: 49px; border-radius: 8px; } 63%,69% { width: 16px; height: 4px; margin-left: -8px; margin-top: -37px; border-radius: 10px; } } </style> </head> <body> <div class="text-container"> <span>Hello</span> <span>Selamat Datang</span> </div> <div class="container"> <div class="loader"></div> <div class="loader"></div> <div class="loader"></div> </div> <script> const textContainer = document.querySelector('.text-container'); const loaderContainer = document.querySelector('.container'); setTimeout(() => { textContainer.style.display = 'none'; loaderContainer.style.display = 'block'; setTimeout(() => { loaderContainer.style.opacity = 1; }, 20); }, 5000); setTimeout(() => { document.body.style.opacity = 0; }, 7000); setTimeout(() => { window.location.href = '/dashboard'; }, 7500); </script> </body> </html> )rawliteral"; server.send(200, "text/html; charset=UTF-8", html); }
+
+void serveDashboardPage() {
+  String html = R"rawliteral(
+<html><head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ESP AC Live Control</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+@keyframes pageFadeIn { from { opacity: 0; } to { opacity: 1; } }
+body { 
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+    text-align: center; 
+    margin: 0; 
+    padding: 20px; 
+    display: flex; 
+    flex-direction: column; 
+    align-items: center; 
+    transition: background-color 0.8s ease, color 0.8s ease;
+}
+.container, .ac-status-section, .room-stats, .history-section, .weather-widget, .control-grid button {
+    transition: background-color 0.8s ease, color 0.8s ease, border-color 0.8s ease, box-shadow 0.3s ease;
+}
+
+/* === TEMA DEFAULT (AC OFF / FAN ONLY) === */
+.theme-off, .theme-fan { color: white; background: linear-gradient(to bottom right, #2c3e50, #3498db); }
+.theme-off .container, .theme-fan .container { background: rgba(255, 255, 255, 0.15); }
+.theme-off h1, .theme-fan h1 { color: #ecf0f1; }
+.theme-off .clock, .theme-fan .clock { color: #f1c40f; }
+.theme-off h2, .theme-fan h2 { color: #e0e0e0; border-bottom-color: rgba(255,255,255,0.2); }
+.theme-off .room-stats, .theme-off .ac-status-section, .theme-off .history-section,
+.theme-fan .room-stats, .theme-fan .ac-status-section, .theme-fan .history-section { background: rgba(0, 0, 0, 0.2); }
+.theme-off .weather-widget, .theme-fan .weather-widget { background: rgba(255, 255, 255, 0.25); }
+.theme-off .control-grid button, .theme-fan .control-grid button { background: #3498db; }
+.theme-off .control-grid button:hover, .theme-fan .control-grid button:hover { background: #2980b9; }
+
+/* === TEMA MODE COOL (Bongkahan Es) === */
+.theme-cool { color: black; background: linear-gradient(to bottom, #d4f2ff, #87CEEB); }
+.theme-cool .container { background: rgba(255, 255, 255, 0.5); }
+.theme-cool h1, .theme-cool .clock, .theme-cool h2, .theme-cool strong { color: #002D62; }
+.theme-cool h2 { border-bottom-color: rgba(0, 45, 98, 0.3); }
+.theme-cool .room-stats, .theme-cool .ac-status-section, .theme-cool .history-section { background: rgba(255, 255, 255, 0.8); /* Putih Salju */ }
+.theme-cool .weather-widget { background: rgba(224, 234, 241, 0.9); /* Sedikit lebih gelap */ }
+.theme-cool .control-grid button { background: #2E86C1; color: white; }
+.theme-cool .control-grid button:hover { background: #1B4F72; }
+.theme-cool .status-item p, .theme-cool .room-stats p, .theme-cool .footer { color: #333; }
+.theme-cool .chart-container { background: rgba(0,0,0,0.05); }
+.theme-cool .on { background: #28B463 !important; }
+.theme-cool .off { background: #CB4335 !important; }
+
+/* === TEMA MODE DRY (Api) === */
+.theme-dry { 
+    color: white; 
+    background-color: #ff8c00;
+    background-image: linear-gradient(to top, #7d0202, #ff8c00), url(https://www.transparentpng.com/thumb/fire/hS3a3S-fire-flame-photo-transparent.png);
+    background-repeat: no-repeat;
+    background-position: center bottom;
+    background-size: cover;
+    background-blend-mode: soft-light;
+}
+.theme-dry .container { background: rgba(0, 0, 0, 0.4); }
+.theme-dry h1, .theme-dry .clock, .theme-dry h2, .theme-dry strong { color: #FFD700; }
+.theme-dry h2 { border-bottom-color: rgba(255, 215, 0, 0.3); }
+.theme-dry .room-stats, .theme-dry .ac-status-section, .theme-dry .history-section { background: #800000; /* Merah Maroon */ }
+.theme-dry .weather-widget { background: #600000; /* Sedikit lebih gelap */ }
+.theme-dry .control-grid button { background: #D95319; color: white; }
+.theme-dry .control-grid button:hover { background: #A13D10; }
+.theme-dry .footer { color: rgba(255,255,255,0.7); }
+
+/* Common styles */
+.container { max-width: 700px; width:90%; margin: 20px auto; padding: 25px; border-radius: 12px; box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3); }
+.clock { font-size: 1.8em; margin-bottom: 25px; font-weight: bold; letter-spacing: 2px; }
+h2 { font-size: 1.6em; margin-top: 20px; margin-bottom:10px; padding-bottom:5px; border-bottom: 1px solid; }
+.weather-widget { display: flex; justify-content: space-between; align-items: center; padding: 15px 25px; border-radius: 12px; margin-bottom: 25px; }
+.weather-info { text-align: left; }
+.weather-info p { margin: 2px 0; }
+#location { font-size: 1.2em; font-weight: bold; }
+#ext-temp { font-size: 1.8em; }
+.weather-icon { font-size: 4em; }
+.status-grid, .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+.status-item p, .room-stats p { margin: 8px 0; font-size: 1.1em; }
+.footer { margin-top: 30px; font-size: 0.9em; }
+.on { background: #2ecc71 !important; } .off { background: #e74c3c !important; }
+.chart-container { position: relative; height: 250px; width: 100%; border-radius: 8px; padding: 15px; box-sizing: border-box; margin-top: 10px; }
+</style>
+<script>
+let historyChart; const MAX_CHART_POINTS = 40; let accumulationReadings = []; const ACCUMULATION_TARGET = 10; let totalAccumulationMinutes = 0;
+function updateTime() { fetch('/time').then(response => response.json()).then(data => { document.getElementById('clock').innerText = data.time; }).catch(err => console.error('Error fetching time:', err)); }
+function updateExternalWeather() { fetch('/externalweather').then(response => response.json()).then(data => { document.getElementById('location').innerText = data.city; document.getElementById('ext-temp').innerText = data.temperature.toFixed(1) + '°C'; let icon = '❓'; switch (data.condition.toLowerCase()) { case 'clear': icon = '☀️'; break; case 'clouds': icon = '🌥️'; break; case 'rain': case 'drizzle': icon = '🌧️'; break; case 'thunderstorm': icon = '⛈️'; break; case 'snow': icon = '❄️'; break; case 'mist': case 'smoke': case 'haze': case 'fog': icon = '🌫️'; break; default: icon = '🌥️'; } document.getElementById('weather-icon').innerHTML = icon; }).catch(err => console.error('Error fetching external weather:', err)); }
+function sendCommand(endpoint) { fetch(endpoint).then(() => { setTimeout(updateLiveState, 250); }); }
+
+function initializeChart() { const ctx = document.getElementById('historyChart').getContext('2d'); historyChart = new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Suhu (°C)', data: [], borderColor: 'rgba(255, 99, 132, 1)', backgroundColor: 'rgba(255, 99, 132, 0.2)', borderWidth: 2, tension: 0.3, yAxisID: 'y' }, { label: 'Kelembapan (%)', data: [], borderColor: 'rgba(54, 162, 235, 1)', backgroundColor: 'rgba(54, 162, 235, 0.2)', borderWidth: 2, tension: 0.3, yAxisID: 'y1' }] }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { color: 'inherit' }, grid: { color: 'rgba(255,255,255,0.1)' } }, y: { type: 'linear', position: 'left', ticks: { color: 'rgba(255, 99, 132, 1)' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Suhu', color: 'inherit' } }, y1: { type: 'linear', position: 'right', ticks: { color: 'rgba(54, 162, 235, 1)' }, grid: { drawOnChartArea: false }, title: { display: true, text: 'Kelembapan', color: 'inherit' } } }, plugins: { legend: { labels: { color: 'inherit' } } } } }); }
+
+function setTheme(mode, isACOn) {
+    const body = document.body;
+    body.classList.remove('theme-off', 'theme-fan', 'theme-cool', 'theme-dry');
+    if (!isACOn) {
+        body.classList.add('theme-off');
+    } else {
+        if (mode === 'COOL') { body.classList.add('theme-cool'); }
+        else if (mode === 'DRY') { body.classList.add('theme-dry'); }
+        else { body.classList.add('theme-fan'); }
+    }
+}
+
+function updateLiveState() {
+    fetch('/status').then(response => response.json()).then(data => {
+        setTheme(data.mode, data.isACOn);
+        document.getElementById('statusVal').innerText = data.isACOn ? 'ON' : 'OFF';
+        document.getElementById('statusVal').className = data.isACOn ? 'on' : 'off';
+        document.getElementById('modeVal').innerText = data.mode;
+        document.getElementById('tempVal').innerText = data.temperature + '°C';
+        document.getElementById('fanVal').innerText = data.fanSpeed;
+        document.getElementById('swinghVal').innerText = data.swingHorizontal ? 'ON' : 'OFF';
+        document.getElementById('swingvVal').innerText = data.swingVertical ? 'ON' : 'OFF';
+        document.getElementById('powerfulVal').innerText = data.powerfulMode ? 'ON' : 'OFF';
+        const roomTemp = data.roomTemp, roomHum = data.roomHumidity;
+        document.getElementById('roomTempVal').innerText = roomTemp.toFixed(1) + '°C';
+        document.getElementById('roomHumVal').innerText = roomHum.toFixed(1) + '%';
+        const now = new Date(), timeLabel = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        historyChart.data.labels.push(timeLabel);
+        historyChart.data.datasets[0].data.push(roomTemp);
+        historyChart.data.datasets[1].data.push(roomHum);
+        if (historyChart.data.labels.length > MAX_CHART_POINTS) { historyChart.data.labels.shift(); historyChart.data.datasets.forEach((ds) => { ds.data.shift(); }); }
+        historyChart.update('none');
+        accumulationReadings.push({ temp: roomTemp, hum: roomHum });
+        if (accumulationReadings.length >= ACCUMULATION_TARGET) {
+            let sumTemp = 0, sumHum = 0;
+            accumulationReadings.forEach(r => { sumTemp += r.temp; sumHum += r.hum; });
+            const avgTemp = (sumTemp / ACCUMULATION_TARGET).toFixed(1), avgHum = (sumHum / ACCUMULATION_TARGET).toFixed(1);
+            totalAccumulationMinutes += 5;
+            document.getElementById('accumulationTime').innerText = totalAccumulationMinutes + " Menit";
+            document.getElementById('avgTempVal').innerText = avgTemp + '°C';
+            document.getElementById('avgHumVal').innerText = avgHum + '%';
+            accumulationReadings = [];
+        }
+    }).catch(err => console.error('Error fetching live state:', err));
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    updateTime(); 
+    updateExternalWeather(); 
+    initializeChart(); 
+    updateLiveState(); // Panggil sekali saat load untuk dapat data awal
+    
+    // Interval untuk jam dan cuaca tetap otomatis
+    setInterval(updateTime, 1000);
+    setInterval(updateExternalWeather, 60000);
+    // Interval untuk updateLiveState dihapus, karena update hanya terjadi saat tombol ditekan
+});
+</script>
+</head><body>
+<div class='container'>
+<h1>❄️ ESP AC Live Control 🌡️</h1>
+<div id='clock' class='clock'>Loading...</div>
+<div class='weather-widget'><div class='weather-info'><p id='location'>Loading...</p><p id='ext-temp'>--°C</p></div><div id='weather-icon' class='weather-icon'>☀️</div></div>
+<div class='room-stats'><h2>🏡 Room Conditions</h2><p><strong>Temperature:</strong> <span id='roomTempVal'>--°C</span></p><p><strong>Humidity:</strong> <span id='roomHumVal'>--%</span></p></div>
+<div class='ac-status-section'><h2>🌬️ AC Status</h2><div class='status-grid'>
+<div class='status-item'><p><strong>Status:</strong> <span id='statusVal' class='off'>OFF</span></p></div>
+<div class='status-item'><p><strong>Mode:</strong> <span id='modeVal'>...</span></p></div>
+<div class='status-item'><p><strong>Temp:</strong> <span id='tempVal'>...</span></p></div>
+<div class='status-item'><p><strong>Fan:</strong> <span id='fanVal'>...</span></p></div>
+<div class='status-item'><p><strong>Swing H:</strong> <span id='swinghVal'>...</span></p></div>
+<div class='status-item'><p><strong>Swing V:</strong> <span id='swingvVal'>...</span></p></div>
+<div class='status-item'><p><strong>Powerful:</strong> <span id='powerfulVal'>...</span></p></div>
+</div></div>
+<h2>⚙️ Controls</h2><div class='control-grid'>
+<button onclick="sendCommand('/on')">AC ON</button><button onclick="sendCommand('/off')">AC OFF</button><button onclick="sendCommand('/mode')">Mode</button><button onclick="sendCommand('/swingh')">Swing H</button>
+<button onclick="sendCommand('/swingv')">Swing V</button><button onclick="sendCommand('/tempup')">Temp Up</button><button onclick="sendCommand('/tempdown')">Temp Down</button><button onclick="sendCommand('/powerful')">Powerful</button>
+</div>
+<div class='history-section'>
+  <h2>📈 Live Sensor History</h2>
+  <div class="chart-container"><canvas id="historyChart"></canvas></div>
+</div>
+<div class='ac-status-section'>
+  <h2>➕ Sensor Accumulation</h2>
+  <p style="margin-bottom: 15px;">Rata-rata suhu dan kelembapan dalam <strong id="accumulationTime">0 Menit</strong> terakhir adalah:</p>
+  <div class='status-grid' style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+    <div class='status-item'><p><strong>Avg. Temp:</strong> <span id='avgTempVal'>--°C</span></p></div>
+    <div class='status-item'><p><strong>Avg. Humidity:</strong> <span id='avgHumVal'>--%</span></p></div>
+  </div>
+</div>
+<div class='footer'>
+    <p>ESP32 AC Control Panel</p>
+    <p>Proyek Protokol Rombel A-1 Program Studi Rumpun Mekatronika Angkatan 56</p>
+    <p class="names">Isma • Dewangga • Fita • Alfa • Gabriel • Indra • Joshua • Leon • Stevent • Syrillus</p>
+</div>
+</div></body></html>
+)rawliteral";
+  server.send(200, "text/html; charset=UTF-8", html);
+}
+
+void handleTime() { struct tm timeinfo; if(!getLocalTime(&timeinfo)){ server.send(503, "application/json", "{\"time\":\"Syncing...\"}"); return; } char timeString[9]; sprintf(timeString, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec); String json = "{\"time\":\"" + String(timeString) + "\"}"; server.send(200, "application/json", json); }
+
+void handleStatus() {
+  String json = "{";
+  json += "\"isACOn\":" + String(isACOn ? "true" : "false") + ",";
+  json += "\"mode\":\"" + getModeString(currentMode) + "\",";
+  json += "\"temperature\":" + String(currentTemperature) + ",";
+  json += "\"fanSpeed\":" + String(currentFanSpeed) + ",";
+  json += "\"swingHorizontal\":" + String(swingHorizontal ? "true" : "false") + ",";
+  json += "\"swingVertical\":" + String(swingVertical ? "true" : "false") + ",";
+  json += "\"powerfulMode\":" + String(isPowerfulModeOn ? "true" : "false") + ",";
+  json += "\"roomTemp\":" + String(currentRoomTemp, 1) + ",";
+  json += "\"roomHumidity\":" + String(currentRoomHumidity, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() { String json = "["; for (size_t i = 0; i < sensorHistory.size(); ++i) { json += "{\"timestamp\":" + String(sensorHistory[i].timestamp) + ","; json += "\"temperature\":" + String(sensorHistory[i].temperature, 1) + ","; json += "\"humidity\":" + String(sensorHistory[i].humidity, 1) + "}"; if (i < sensorHistory.size() - 1) { json += ","; } } json += "]"; server.send(200, "application/json", json); }
+void handleExternalWeather() { String json = "{"; json += "\"city\":\"" + locationCity + "\","; json += "\"temperature\":" + String(externalTemp, 1) + ","; json += "\"humidity\":" + String(externalHumidity, 1) + ","; json += "\"condition\":\"" + weatherCondition + "\""; json += "}"; server.send(200, "application/json", json); }
+String getModeString(uint8_t mode) { switch (mode) { case kDaikinCool: return "COOL"; case kDaikinDry: return "DRY"; case kDaikinFan: return "FAN ONLY"; default: return "UNKNOWN"; } }
+void handleCommand(String command) { if (command.equalsIgnoreCase("ON")) { turnACOn(); } else if (command.equalsIgnoreCase("OFF")) { turnACOff(); } else if (isACOn) { if (command.equalsIgnoreCase("FAN")) { changeFanSpeed(); } else if (command.equalsIgnoreCase("SWINGH")) { toggleSwingHorizontal(); } else if (command.equalsIgnoreCase("SWINGV")) { toggleSwingVertical(); } else if (command.equalsIgnoreCase("TEMPUP")) { increaseTemperature(); } else if (command.equalsIgnoreCase("TEMPDOWN")) { decreaseTemperature(); } else if (command.equalsIgnoreCase("MODE")) { changeMode(); } else if (command.equalsIgnoreCase("POWERFUL")) { if (!isPowerfulModeOn) activatePowerfulMode(); else deactivatePowerfulMode(); } else { Serial.println("Unknown command."); } } else { Serial.println("AC is OFF. Please turn it ON first."); } }
+void handleOn()      { playButtonSound(); turnACOn(); server.send(200, "text/plain", "OK"); }
+void handleOff()     { playButtonSound(); turnACOff(); server.send(200, "text/plain", "OK"); }
+void handleFan()     { playButtonSound(); if (isACOn) changeFanSpeed(); server.send(200, "text/plain", "OK"); }
+void handleSwingH()  { playButtonSound(); if (isACOn) toggleSwingHorizontal(); server.send(200, "text/plain", "OK"); }
+void handleSwingV()  { playButtonSound(); if (isACOn) toggleSwingVertical(); server.send(200, "text/plain", "OK"); }
+void handleTempUp()  { playButtonSound(); if (isACOn) increaseTemperature(); server.send(200, "text/plain", "OK"); }
+void handleTempDown() { playButtonSound(); if (isACOn) decreaseTemperature(); server.send(200, "text/plain", "OK"); }
+void handleMode()    { playButtonSound(); if (isACOn) changeMode(); server.send(200, "text/plain", "OK"); }
+void handlePowerful() { playButtonSound(); if (isACOn) { if (!isPowerfulModeOn) activatePowerfulMode(); else deactivatePowerfulMode(); } server.send(200, "text/plain", "OK"); }
+
+// =================================================================
+//  Fungsi-Fungsi untuk Kontrol AC
+// =================================================================
+void turnACOn() { if (!isACOn) { isACOn = true; Serial.println("Turning AC ON"); } else { Serial.println("AC is already ON. Resending current state..."); } ac.on(); ac.setMode(currentMode); ac.setTemp(currentTemperature); ac.setSwingVertical(swingVertical); ac.setSwingHorizontal(swingHorizontal); ac.setFan(currentFanSpeed); ac.setPowerful(isPowerfulModeOn); ac.send(); }
+void turnACOff() { if (isACOn) { isACOn = false; isPowerfulModeOn = false; Serial.println("Turning AC OFF"); ac.off(); ac.send(); } else { Serial.println("AC is already OFF."); } }
+void changeFanSpeed() { if (!isACOn) return; isPowerfulModeOn = false; currentFanSpeed++; if (currentFanSpeed > 5) currentFanSpeed = 1; Serial.print("Setting fan speed to: "); Serial.println(currentFanSpeed); ac.setFan(currentFanSpeed); ac.setPowerful(false); ac.send(); }
+void toggleSwingHorizontal() { if (!isACOn) return; swingHorizontal = !swingHorizontal; Serial.print("Setting horizontal swing to: "); Serial.println(swingHorizontal ? "ON" : "OFF"); ac.setSwingHorizontal(swingHorizontal); ac.send(); }
+void toggleSwingVertical() { if (!isACOn) return; isPowerfulModeOn = false; swingVertical = !swingVertical; Serial.print("Setting vertical swing to: "); Serial.println(swingVertical ? "ON" : "OFF"); ac.setSwingVertical(swingVertical); ac.setPowerful(false); ac.send(); }
+void increaseTemperature() { if (!isACOn) return; isPowerfulModeOn = false; if (currentTemperature < 30) currentTemperature++; Serial.print("Increasing temperature to: "); Serial.println(currentTemperature); ac.setTemp(currentTemperature); ac.setPowerful(false); ac.send(); }
+void decreaseTemperature() { if (!isACOn) return; isPowerfulModeOn = false; if (currentTemperature > 16) currentTemperature--; Serial.print("Decreasing temperature to: "); Serial.println(currentTemperature); ac.setTemp(currentTemperature); ac.setPowerful(false); ac.send(); }
+void changeMode() { if (!isACOn) return; isPowerfulModeOn = false; if (currentMode == kDaikinCool) { currentMode = kDaikinDry; Serial.println("Changing mode to DRY"); } else if (currentMode == kDaikinDry) { currentMode = kDaikinFan; Serial.println("Changing mode to FAN ONLY"); } else if (currentMode == kDaikinFan) { currentMode = kDaikinCool; Serial.println("Changing mode to COOL"); } ac.setMode(currentMode); ac.setPowerful(false); ac.send(); }
+void activatePowerfulMode() { if (!isACOn || isPowerfulModeOn) return; Serial.println("Activating Powerful mode..."); isPowerfulModeOn = true; ac.setPowerful(true); ac.send(); }
+void deactivatePowerfulMode() { if (!isACOn || !isPowerfulModeOn) return; Serial.println("Deactivating Powerful mode..."); isPowerfulModeOn = false; ac.setPowerful(false); ac.setMode(currentMode); ac.setTemp(currentTemperature); ac.setFan(currentFanSpeed); ac.setSwingHorizontal(swingHorizontal); ac.setSwingVertical(swingVertical); ac.send(); }
