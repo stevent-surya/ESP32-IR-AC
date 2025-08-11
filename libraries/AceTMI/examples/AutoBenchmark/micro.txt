@@ -1,0 +1,11 @@
+SIZEOF
+sizeof(SimpleTmi1637Interface): 3
+sizeof(SimpleTmi1637FastInterface<4, 5, 100>): 1
+sizeof(SimpleTmi1638Interface): 4
+sizeof(SimpleTmi1638FastInterface<4, 5, 6, 1>): 1
+BENCHMARKS
+SimpleTmi1637Interface,1us 756 761 764 20
+SimpleTmi1637FastInterface,1us 84 88 96 20
+SimpleTmi1638Interface,1us 756 764 768 20
+SimpleTmi1638FastInterface,1us 76 79 88 20
+END
